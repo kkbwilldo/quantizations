@@ -10,7 +10,7 @@
         - `Llama3-8B-Instruct`
         - `native generate API without any other third-party libraries`.
     - 목표        
-        - TPS : 2배 (with the batch size of 1)
+        - TPS : 2.8배 (with the batch size of 1)
 
 ## WIP
 
@@ -22,9 +22,10 @@
 
 ![kbkim_linear4bit](./images/q_linear.png)
 
-- 현재 native generate API보다 
+- 현재 native Llama3보다 
     - 1.8배 빠른 추론 속도(20 TPS -> 37.5 TPS)
     - peak VRAM memory 사용량은 19%(30.22 GB -> 5.78 GB)
+    - IFEval 벤치마크 결과 native Llama3와 quantized Llama3가 같음을 확인
 - 그러나 Ncu 프로파일링 결과, 아직 약 50%의 성능 개선 room이 있음
 
 ![ncu_profiling](./images/ncu.png)
