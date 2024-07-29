@@ -22,7 +22,9 @@
 
 ![kbkim_linear4bit](./images/q_linear.png)
 
-- 현재 native generate API보다 1.8배 빠른 추론 속도
+- 현재 native generate API보다 
+    - 1.8배 빠른 추론 속도(20 TPS -> 37.5 TPS)
+    - peak VRAM memory 사용량은 19%(30.22 GB -> 5.78 GB)
 - 그러나 Ncu 프로파일링 결과, 아직 약 50%의 성능 개선 room이 있음
 
 ![ncu_profiling](./images/ncu.png)
