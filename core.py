@@ -1,6 +1,10 @@
 import json
 import torch
 import operator
+import numpy as np
+
+import triton
+import triton.language as tl
 
 #############################################################
 # # Nsys 프로파일링 시 필요
@@ -480,7 +484,6 @@ def gemv_4bit(
     lda = Bshape[0]
     ldc = Bshape[0]
     ldb = (A.shape[-1] + 1) // 2
-
     # custom kernel 호출
     if B.dtype in [torch.uint8, torch.bfloat16, torch.float16, torch.float32]:
         kbkim_lib.cgemm_4bit_inference_naive_fp32(
@@ -631,4 +634,284 @@ def dequantize_4bit(
     )
 
     # 텐서를 transpose하여 반환
-    return out.t() 
+    return out.t()
+
+
+@triton.jit
+def qbvm_kernel(
+    bits,
+    a_ptr, b_ptr, c_ptr,
+    scales_ptr, zeros_ptr,
+    M, N, K,
+    stride_abatch, stride_am, stride_ak,
+    stride_bbatch, stride_bk, stride_bn,
+    stride_cbatch, stride_cm, stride_cn,
+    stride_scales_b, stride_scales_k, stride_scales_g,
+    stride_zeros_b, stride_zeros_k, stride_zeros_g,
+    groupsize,
+    BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+):
+    """
+    입력 벡터 A와 행렬 B에 대한 양자화된 행렬-벡터 곱셈을 수행합니다.
+    
+    Args:
+    - bits (int): 양자화 비트 수.
+    - a_ptr (int): 입력 벡터 A의 포인터.
+    - b_ptr (int): 입력 행렬 B의 포인터.
+    - c_ptr (int): 출력 텐서 C의 포인터.
+    - scales_ptr (int): 스케일 텐서의 포인터.
+    - zeros_ptr (int): 제로 텐서의 포인터.
+    - N (int): 출력 텐서 C의 크기.
+    - K (int): 입력 벡터 A의 크기.
+     - stride_abatch (int): A의 배치 차원의 스트라이드.
+    - stride_am (int): A의 sequence 차원의 스트라이드.
+    - stride_ak (int): A의 feature 차원의 스트라이드.
+    - stride_bbatch (int): B의 배치 차원의 스트라이드.
+    - stride_bk (int): B의 sequence 차원의 스트라이드.
+    - stride_bn (int): B의 feature 차원의 스트라이드.
+    - stride_cbatch (int): C의 배치 차원의 스트라이드.
+    - stride_cm (int): C의 sequence 차원의 스트라이드.
+    - stride_cn (int): C의 feature 차원의 스트라이드.
+    - stride_scales_b (int): 스케일 텐서의 배치 차원의 스트라이드.
+
+
+
+    Compute the batch matrix multiplication C = A x B.
+    A is of shape (B, 1, K) float16
+    B is of shape (B, K, N//feat_per_int) int32
+    C is of shape (B, 1, N) float16
+    scales is of shape (B, K, G) float16
+    zeros is of shape (B, K, G) float16
+    groupsize is an int specifying the size of groups for scales and zeros.
+    G is N // groupsize.
+    Set NO_GROUPS to groupsize == K, in which case G = 1 and the kernel is more efficient.
+
+    WARNING: This kernel assumes that K is a multiple of BLOCK_SIZE_K.
+    WARNING: This kernel assumes that N is a multiple of BLOCK_SIZE_N.
+    WARNING: This kernel assumes that groupsize is a multiple of BLOCK_SIZE_K.
+    """
+
+    # 
+    pid_batch = tl.program_id(axis=0)
+    pid = tl.program_id(axis=1)
+    feat_per_int = 32 // bits
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_k = tl.cdiv(K, BLOCK_SIZE_K)
+    pid_n = pid % num_pid_n
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_batch_offset = (pid_batch * stride_abatch)
+    b_batch_offset = (pid_batch * stride_bbatch)
+    c_batch_offset = (pid_batch * stride_cbatch)
+    a_ptr = a_ptr + a_batch_offset 
+    b_ptr = b_ptr + b_batch_offset 
+    c_ptr = c_ptr + c_batch_offset
+    a_ptrs = a_ptr + (offs_k[:, None] * stride_ak)   # (BLOCK_SIZE_K, 1)
+    # a_mask = (offs_am[:, None] < M)
+    # b_ptrs is set up such that it repeats elements along the N axis feat_per_int times
+    b_ptrs = b_ptr  + (offs_k[:, None] * stride_bk + (offs_bn[None, :]//feat_per_int) * stride_bn)   # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+    # shifter is used to extract the # bits bits of each element in the 32-bit word from B
+    shifter = (offs_bn % feat_per_int) * bits
+    scales_ptr = scales_ptr + pid_batch*stride_scales_b + ((offs_bn[None, :] // groupsize)) * stride_scales_g   # (BLOCK_SIZE_N,)
+    zeros_ptr = zeros_ptr + pid_batch*stride_zeros_b + ((offs_bn[None, :] // groupsize)) * stride_zeros_g   # (BLOCK_SIZE_N,)
+
+    # Now calculate a block of output of shape (BLOCK_SIZE_M, BLOCK_SIZE_N)
+    # M is along the batch dimension, N is along the outfeatures dimension, K is along the infeatures dimension
+    # So this loop is along the infeatures dimension (K)
+    # It's calculating BLOCK_SIZE_M batches in parallel, and for each batch, BLOCK_SIZE_N outfeatures in parallel   
+    # accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
+    num = 0xFF >> (8-bits)
+    for pid_k in range(0, num_pid_k):
+        offs_bk = (offs_k[:, None] + pid_k * BLOCK_SIZE_K)
+        # offs_k[None, :] < K - pid_k * BLOCK_SIZE_K
+        a = tl.load(a_ptrs, mask=offs_bk < K, other=0.)   # (1, BLOCK_SIZE_K)
+        b = tl.load(b_ptrs, mask=offs_bk < K, other=0.)   # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        ptr = scales_ptr + offs_bk * stride_scales_k 
+        scales = tl.load(ptr, mask=offs_bk < K, other=0.)  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        ptr = zeros_ptr + offs_bk * stride_zeros_k  
+        zeros = tl.load(ptr, mask=offs_bk < K, other=0.)  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        # Now we need to unpack b into 32-bit values
+        # tl.device_print("scale ",scales.dtype)
+        # tl.device_print("zeros ",zeros.dtype)
+        b = (b >> shifter[None, :]) & num  # For 4-bit values, bit_op_num is 0xF
+        b = b * scales + zeros # Scale and shift
+        accumulator += tl.sum(a * b, 0) # tl.dot(a, b)
+        # if pid_m == 0 and pid_n == 0:
+        #   tl.device_print("hello ", tl.dot(a, b).shape)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+    c = accumulator # .to(tl.float16)
+    # c = accumulator
+    # Store the result
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cn * offs_cn
+    c_mask = (offs_cn < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+
+def triton_bmm_fA_qB_outer(group_size: int, 
+                fA: torch.FloatTensor, 
+                qB: torch.IntTensor, 
+                scales: torch.FloatTensor, 
+                zeros: torch.FloatTensor,
+                bits: int) -> torch.FloatTensor:
+    """
+    Args:
+    - group_size (int): 각 그룹의 외부 차원 수. G = N // group_size.
+    - fA (torch.FloatTensor): 입력 텐서 fA. shape은 (B, nh, M, K), dtype은 torch.float16.
+    - qB (torch.IntTensor): 입력 텐서 qB. shape은 (B, nh, K, N // feat_per_int), dtype은 torch.int32.
+    - scales (torch.FloatTensor): 입력 텐서 scales. shape은 (B, nh, K, G), dtype은 torch.float16.
+    - zeros (torch.FloatTensor): 입력 텐서 zeros. shape은 (B, nh, K, G), dtype은 torch.float16.
+    - bits (int): 양자화 비트 수.
+
+    Returns:
+    - torch.FloatTensor: 결과 텐서 C.
+    """    
+
+    # 입력 텐서의 차원 확인
+    assert len(fA.shape) == 4 and len(qB.shape) == 4
+
+    # 입력 텐서의 shape
+    B, nh, M, K = fA.shape
+
+    feat_per_int = 32 // bits
+
+    # fA를 3차원 텐서로 flatten
+    fA = fA.view(-1, M, K)
+    N = qB.shape[-1] * feat_per_int
+
+    # qB를 3차원 텐서로 flatten
+    qB = qB.reshape(-1, K, qB.shape[-1])
+    flatten_B = B * nh
+
+    # 결과 텐서 C 초기화
+    c = torch.empty((flatten_B, M, N), device='cuda', dtype=torch.float16)
+
+    # Triton 그리드 설정
+    grid = lambda META: (
+        flatten_B, triton.cdiv(N, META['BLOCK_SIZE_N']),
+    )
+
+    # scales와 zeros를 3차원 텐서로 flatten
+    scales = scales.view(flatten_B, scales.shape[-2], scales.shape[-1])
+    zeros = zeros.view(flatten_B, zeros.shape[-2], zeros.shape[-1])
+
+    # 
+    if N > K:
+        BLOCK_SIZE_N = 128  
+        BLOCK_SIZE_K = 32
+        num_warps=4  #
+    else:
+        BLOCK_SIZE_N = 32
+        BLOCK_SIZE_K = 128
+        num_warps = 2
+    num_stages= 7 if K > 64 else 3
+
+    # Triton 커널 호출
+    qbvm_kernel[grid](
+        bits, 
+        fA, qB, c,
+        scales, zeros,
+        M, N, K,
+        fA.stride(0), fA.stride(1), fA.stride(2), 
+        qB.stride(0), qB.stride(1), qB.stride(2),
+        c.stride(0), c.stride(1), c.stride(2),
+        scales.stride(0), scales.stride(1), scales.stride(2),
+        zeros.stride(0), zeros.stride(1), scales.stride(2),
+        group_size, BLOCK_SIZE_N, BLOCK_SIZE_K, 
+        num_warps=num_warps, num_stages=num_stages
+    )
+
+    # 결과 텐서 C를 원래 shape로 reshape 후 반환
+    return c.view(B, nh, c.shape[-2], c.shape[-1])
+
+
+@triton.jit
+def _pack_along_last_dim(
+    bits: tl.constexpr,
+    intensor_ptr,
+    code_ptr,
+    N,
+    num_feats: tl.constexpr,
+    feat_per_int: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr
+):
+    """
+    
+    """
+    num_int_per_y_dim = num_feats // feat_per_int
+    bid = tl.program_id(axis=0)
+    yid = tl.program_id(axis=1)
+    offs_N = bid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    block_start = intensor_ptr + offs_N * num_feats + yid * feat_per_int # offset of the first element at current tile
+    packed = tl.zeros((BLOCK_SIZE_N,), dtype=tl.int32)
+    for i in range(feat_per_int):
+        ptr = block_start + i
+        element = tl.load(ptr, mask=offs_N<N, other=0.)
+        element = element << (i * bits)
+        # Combine the value using bitwise OR
+        packed = packed | element
+    tl.store(code_ptr + offs_N * num_int_per_y_dim + yid, packed, mask=offs_N < N)
+
+
+@triton.jit
+def _minmax_along_last_dim(
+    x_ptr,
+    mn_ptr, mx_ptr,
+    total_elements: tl.constexpr, 
+    N: tl.constexpr,
+    num_groups: tl.constexpr, 
+    group_size: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr
+):
+    bid = tl.program_id(axis=0)
+    offsets_b = bid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offsets = offsets_b[:, None] * group_size + tl.arange(0, group_size)[None, :]
+    mask = offsets < total_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    mx_val = tl.max(x, axis=1)
+    mn_val = tl.min(x, axis=1)
+    # tl.device_print('shape', mn_val[:, None].shape)
+    tl.store(mn_ptr+offsets_b, mn_val, mask=offsets_b<N*num_groups)
+    tl.store(mx_ptr+offsets_b, mx_val, mask=offsets_b<N*num_groups) 
+
+
+def quantize_kv_2bit(data: torch.Tensor, group_size: int, bit: int):
+    assert len(data.shape) == 4
+    shape = data.shape
+    B, nh, D, T = shape
+    # ================== Get Scale & Zeros ===============
+    if T%group_size!=0:
+        breakpoint()
+    assert T % group_size == 0
+    num_groups = T // group_size
+    new_shape = (B * nh * D, num_groups, group_size)
+    scale_mn_shape = B, nh, D, num_groups
+    # Quantize
+    data = data.reshape(new_shape)
+    mx = torch.empty((B * nh * D, num_groups), device=data.device, dtype=data.dtype)
+    mn = torch.empty((B * nh * D, num_groups), device=data.device, dtype=data.dtype)
+    BLOCK_SIZE_N = 128
+    grid = lambda meta: (triton.cdiv(data.shape[0]*data.shape[1], BLOCK_SIZE_N),)
+    _minmax_along_last_dim[grid](data, mn, mx,
+                             data.numel(), data.shape[0], num_groups, group_size,
+                             BLOCK_SIZE_N=BLOCK_SIZE_N, num_warps=8) 
+    # mn = torch.min(data, dim=-1, keepdim=True)[0].squeeze(-1)
+    # mx = torch.max(data, dim=-1, keepdim=True)[0].squeeze(-1)
+    scale = (mx - mn) / (2 ** bit - 1)
+    data = data - mn.unsqueeze(-1)
+    data.div_(scale.unsqueeze(-1))
+    data = data.clamp_(0, 2 ** bit - 1).round_().to(torch.int32)
+    data = data.view(-1, T)
+    feat_per_int = 32 // bit
+    packshape = (np.prod(shape[:-1]), shape[-1] // feat_per_int,)
+    code = torch.zeros(*packshape, device=data.device, dtype=torch.int32)
+    grid = lambda meta: (triton.cdiv(data.shape[0], BLOCK_SIZE_N), data.shape[1] // feat_per_int,)
+    _pack_along_last_dim[grid](bit, data, code, data.shape[0], 
+                                data.shape[1], feat_per_int, 
+                                BLOCK_SIZE_N=BLOCK_SIZE_N, 
+                                num_warps=8)
+    return code.view(B, nh, D, -1), scale.reshape(scale_mn_shape), mn.reshape(scale_mn_shape)
+
